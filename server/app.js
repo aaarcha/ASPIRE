@@ -51,10 +51,10 @@ const PRINCIPAL_ROOM = D.PRINCIPAL_ROOM;
 export const DEMO_PASSWORD = "Sinalhan-Demo-2026!";
 export const DEMO_ADMIN_EMAIL = "admin@sinalhanes.deped.ph";
 
-const ACCOUNT_ROLES = new Set(["teacher", "principal", "responder", "parent", "super_admin"]);
+const ACCOUNT_ROLES = new Set(["teacher", "principal", "responder", "parent"]);
 // A responder belongs to exactly one organisation — there is no shared account.
 const ACCOUNT_ORGS = new Set(D.RESPONDER_ORG_IDS);
-const ADMIN_ROLES = new Set(["super_admin", "principal"]); // role-based idle timeout: short for admins
+const ADMIN_ROLES = new Set(["principal"]); // role-based idle timeout: short for admins
 const normEmail = (v) => String(v ?? "").trim().toLowerCase();
 const emailOk = (e) => e.length <= 160 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const maskEmail = (e) => {
@@ -86,6 +86,7 @@ function makeTempPassword(account = {}) {
 export function createApp(opts = {}) {
   const {
     dataDir = "",
+    databaseUrl = process.env.DATABASE_URL || "",
     secret = crypto.randomBytes(32).toString("hex"),
     accessCode = "",
     staticDir = "",
@@ -93,8 +94,14 @@ export function createApp(opts = {}) {
     schoolPhone = "",
     seedDemoIncident = false,
     seedDemoAccounts = false,
+    // Deprecated compatibility aliases (ASPIRE_SUPER_ADMIN_*): they now
+    // bootstrap a Principal, because the Super Admin role no longer exists.
     superAdminEmail = "",
     superAdminPassword = "",
+    principalEmail = "",
+    principalPassword = "",
+    resetPrincipal = false,
+    requireTeacherGmail = false,
     historyDays = 90,
     escalationMinutes = D.DEFAULT_ESCALATION_MINUTES,
     scryptN = 16384,
@@ -109,11 +116,35 @@ export function createApp(opts = {}) {
     mailDriver,
     mailFrom,
     mailSend,
-    appBaseUrl = process.env.APP_BASE_URL || "http://localhost:5173",
+    // Where invitation and code emails point. Empty means "work it out from the
+    // request (or the host's public domain)", so a deployment that forgets
+    // APP_BASE_URL still mails a usable link instead of http://localhost.
+    appBaseUrl = process.env.APP_BASE_URL || "",
   } = opts;
 
-  const store = createStore({ dataDir, onPersistError: (...a) => log(...a) });
+  const store = createStore({ dataDir, databaseUrl, onPersistError: (...a) => log(...a) });
   const mailer = createMailer({ driver: mailDriver, from: mailFrom, sendOverride: mailSend });
+  {
+    // Say out loud at boot whether mail can work – the alternative is an operator
+    // discovering it only when a teacher never receives an invitation.
+    const s = mailer.status();
+    if (s.problem) log(`mail: NOT configured (${s.problem}) – invitation and verification emails will not be sent`);
+    else if (s.configured) log(`mail: ${s.driver}${s.host ? ` via ${s.host}:${s.port}${s.secure ? " (TLS)" : " (STARTTLS)"}` : ""} as ${s.user || "no auth"}`);
+  }
+  const configuredBaseUrl = String(appBaseUrl).replace(/\/+$/, "");
+  // RAILWAY_PUBLIC_DOMAIN / RENDER_EXTERNAL_URL are set by the hosts themselves,
+  // which covers mail sent outside a request (e.g. the school-year rollover).
+  const hostBaseUrl =
+    configuredBaseUrl ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "") ||
+    String(process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/, "");
+  function baseUrlFor(req) {
+    if (hostBaseUrl) return hostBaseUrl;
+    const host = String(req?.headers?.["x-forwarded-host"] || req?.headers?.host || "").split(",")[0].trim();
+    const proto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim()
+      || (req?.socket?.encrypted ? "https" : "http");
+    return host ? `${proto}://${host}` : "http://localhost:5173";
+  }
   // Placeholder retention periods (see server/retention.js): read once at boot,
   // invalid env values fall back to the defaults with a warning.
   const retention = createRetention({ env: process.env, warn: (msg) => log(msg) });
@@ -133,7 +164,7 @@ export function createApp(opts = {}) {
   ]);
   const isInternalLog = (l) => Boolean(l && l.internal) || INTERNAL_LOG_ACTIONS.has(String(l && l.action));
   const operationalLog = (i) => (Array.isArray(i.log) ? i.log : []).filter((l) => !isInternalLog(l));
-  const keepsInternal = (user) => user.role === "principal" || user.role === "super_admin";
+  const keepsInternal = (user) => user.role === "principal";
 
   const SESSION_TTL_MS = sessionDays * 24 * 3600 * 1000;
 
@@ -197,7 +228,7 @@ export function createApp(opts = {}) {
   function labelAccount(acc) {
     if (!acc) return null;
     if (acc.status === "purged") return "Deleted account";
-    const roleLabel = { teacher: "Teacher", principal: "Principal", super_admin: "Admin", responder: "Responder", parent: "Parent/PTA" }[acc.role] || acc.role;
+    const roleLabel = { teacher: "Teacher", principal: "Principal", responder: "Responder", parent: "Parent/PTA" }[acc.role] || acc.role;
     return `${acc.email} (${roleLabel}, ${orgOf(acc)})`;
   }
   function actorLabelFor(ref) {
@@ -290,7 +321,6 @@ export function createApp(opts = {}) {
     const db = store.db;
     if (!acc || acc.status !== "active") return null;
     const emailState = { email: acc.email, emailVerifiedAt: acc.emailVerifiedAt ?? null, pendingEmail: acc.pendingEmail ?? null };
-    if (acc.role === "super_admin") return { id: acc.id, role: "super_admin", name: acc.name, subtitle: acc.email, ...emailState };
     if (acc.role === "principal") return { id: acc.id, role: "principal", name: acc.name, subtitle: acc.email, ...emailState };
     if (acc.role === "responder") {
       const org = D.orgById(acc.org) ? acc.org : null;
@@ -436,7 +466,7 @@ export function createApp(opts = {}) {
     if (!mailAccountAllowed(acc)) return { ok: false, reason: "rate_limited" };
     if (realAddressBlocked(acc)) return { ok: false, reason: "send_failed" };
     const { raw, id } = newVerification(acc, "invite", acc.email, "invite");
-    const result = await mailer.send(inviteMessage({ to: acc.email, token: raw, appBaseUrl }));
+    const result = await mailer.send(inviteMessage({ to: acc.email, token: raw, appBaseUrl: baseUrlFor(req) }));
     if (!result.ok) {
       discardVerification(acc, "invite", raw, "invite");
       return { ok: false, reason: "send_failed" };
@@ -453,7 +483,7 @@ export function createApp(opts = {}) {
     if (!mailAccountAllowed(acc)) return { ok: false, reason: "rate_limited" };
     if (mailer.driver !== "console" && /@sinalhanes\.deped\.ph$/i.test(String(to))) return { ok: false, reason: "send_failed" };
     const { raw, id } = newVerification(acc, purpose, to, "code");
-    const result = await mailer.send(codeMessage({ to, code: raw, purpose, appBaseUrl }));
+    const result = await mailer.send(codeMessage({ to, code: raw, purpose, appBaseUrl: baseUrlFor(req) }));
     if (!result.ok) {
       discardVerification(acc, purpose, raw, "code");
       return { ok: false, reason: "send_failed" };
@@ -605,8 +635,8 @@ export function createApp(opts = {}) {
     if (acc.status === "archived") throw new HttpError(409, "already_archived", "That account is already archived.");
     if (acc.status === "purged") throw new HttpError(409, "already_purged", "That account has been purged.");
     if (acc.id === by) throw bad("You cannot archive your own account.");
-    if (acc.role === "super_admin" && !store.db.accounts.some((a) => a.id !== acc.id && a.role === "super_admin" && a.status === "active"))
-      throw new HttpError(409, "last_admin", "At least one Super Admin account must stay active.");
+    if (acc.role === "principal" && !store.db.accounts.some((a) => a.id !== acc.id && a.role === "principal" && a.status === "active"))
+      throw new HttpError(409, "last_admin", "At least one Principal account must stay active.");
     const t = now();
     acc.status = "archived";
     acc.archivedAt = t;
@@ -704,7 +734,6 @@ export function createApp(opts = {}) {
   }
 
   function canSee(i, user) {
-    if (user.role === "super_admin") return false; // console-only role: accounts + audit, never incident data
     if (user.role === "principal") return true;
     const a = audienceOf(i);
     // A school-only drill is staff-only: responders never see it. A simulation
@@ -755,9 +784,9 @@ export function createApp(opts = {}) {
     const open = i.status !== "RESOLVED" && !i.archivedAt;
     let section = null;
     if (required && user.role === "teacher" && user.section && sections.includes(user.section)) section = user.section;
-    if (required && user.role === "principal") section = sections.length === 1 ? sections[0] : null;
+    if (required && (user.role === "principal")) section = sections.length === 1 ? sections[0] : null;
     const registry = section ? (store.db.roster.find((r) => r.section === section)?.registry ?? null) : null;
-    const visible = required && (user.role === "principal" || (user.role === "teacher" && Boolean(user.section) && sections.includes(user.section)));
+    const visible = required && ((user.role === "principal") || (user.role === "teacher" && Boolean(user.section) && sections.includes(user.section)));
     return {
       required,
       visible,
@@ -844,7 +873,6 @@ export function createApp(opts = {}) {
   const REPORTER_ROLE_LABEL = {
     teacher: "Teacher",
     principal: "Principal",
-    super_admin: "Admin",
     responder: "Responder",
     parent: "Parent/PTA",
   };
@@ -1072,7 +1100,7 @@ export function createApp(opts = {}) {
       modes: publicModes(user),
       drills: user.role === "principal" ? db.drills.slice(-10).reverse() : [],
       // Scoring internals (weights, thresholds) are deliberately absent: they are only
-      // available to Super Admin through /api/admin/config.
+      // available to Principal through /api/admin/config.
     };
   }
 
@@ -1577,7 +1605,6 @@ export function createApp(opts = {}) {
     });
     store.save();
   }
-  if (seedDemoIncident) seedDemo();
 
   // Demo accounts (teachers/parents/principal/responder with a known demo password) exist ONLY in demo mode.
   function seedDemoAccountsFn() {
@@ -1595,22 +1622,91 @@ export function createApp(opts = {}) {
     for (const sec of sections()) mk(`parent-${slugify(sec)}@sinalhanes.deped.ph`, "parent", "Parent / PTA Representative", { section: sec });
     audit("account_seeded", { detail: `${store.db.accounts.length} demo accounts seeded (demo mode)` });
   }
-  if (seedDemoAccounts) seedDemoAccountsFn();
 
-  // First Super Admin: created once from the environment (one-time bootstrap).
-  // The bootstrap password obeys the same policy as every other account and must be
-  // changed at first sign-in; it is never written to the audit log.
-  if (superAdminEmail && superAdminPassword) {
-    const email = normEmail(superAdminEmail);
-    const problem = passwordProblem(superAdminPassword, { email, name: "Super Admin" });
-    if (!emailOk(email)) log("ASPIRE_SUPER_ADMIN_EMAIL is not a valid email – no Super Admin account created.");
-    else if (problem) log(`ASPIRE_SUPER_ADMIN_PASSWORD does not meet the password policy (${problem}) – no Super Admin account created.`);
-    else if (!findAccount(email)) {
-      newAccount({ email, role: "super_admin", name: "Super Admin", password: superAdminPassword, mustChange: true, id: "super-admin" });
-      audit("account_created", { by: "bootstrap", target: email, detail: "initial Super Admin (env bootstrap)" });
-      log(`Super Admin account created for ${email} – password change required at first sign-in.`);
+
+  // First-run provisioning (demo seed + the env Principal). With Postgres the
+  // stored document is still loading when createApp() returns, so this waits for
+  // it: provisioning against the empty in-memory copy would be lost, and would
+  // re-create the Principal (with a "created" log line) on every cold start.
+  function bootstrapInitialState() {
+    if (seedDemoIncident) seedDemo();
+    if (seedDemoAccounts) seedDemoAccountsFn();
+
+    // Deprecated Super Admin bootstrap: create a Principal instead, so a host
+    // upgrading from the old role keeps its admin login.
+    if (superAdminEmail && superAdminPassword) {
+      const email = normEmail(superAdminEmail);
+      const problem = passwordProblem(superAdminPassword, { email, name: "School Principal" });
+      if (!emailOk(email)) log("ASPIRE_SUPER_ADMIN_EMAIL is not a valid email – no Principal account created.");
+      else if (problem) log(`ASPIRE_SUPER_ADMIN_PASSWORD does not meet the password policy (${problem}) – no Principal account created.`);
+      else if (!findAccount(email)) {
+        newAccount({ email, role: "principal", name: "School Principal", password: superAdminPassword, mustChange: true });
+        audit("account_created", { by: "bootstrap", target: email, detail: "initial Principal (legacy env bootstrap)" });
+        log(`Principal account created for ${email} – password change required at first sign-in.`);
+      }
+    }
+
+    // Operator-driven credential recovery. Set ASPIRE_RESET_PRINCIPAL=1 in the
+    // host's variables together with ASPIRE_PRINCIPAL_EMAIL /
+    // ASPIRE_PRINCIPAL_PASSWORD and restart: the Principal keeps its id and its
+    // history, but the address, password and verification state are taken from
+    // the environment, the lockout counter is cleared and every open session is
+    // revoked. Remove the flag afterwards – it applies on every boot while set.
+    if (resetPrincipal) {
+      const current = store.db.accounts.find((a) => a.role === "principal" && a.status !== "purged") || null;
+      const email = principalEmail ? normEmail(principalEmail) : current?.email || "";
+      const owner = email ? findAccount(email) : null;
+      const issue = !principalPassword
+        ? "ASPIRE_PRINCIPAL_PASSWORD is not set"
+        : !email || !emailOk(email)
+          ? "ASPIRE_PRINCIPAL_EMAIL is not a valid email address"
+          : owner && owner !== current
+            ? `${email} already belongs to another account`
+            : passwordProblem(principalPassword, { email, name: current?.name || "School Principal" });
+      if (issue) {
+        log(`ASPIRE_RESET_PRINCIPAL: ${issue} – the credentials were not changed.`);
+      } else {
+        const acc = current || newAccount({ email, role: "principal", name: "School Principal", password: principalPassword, mustChange: true, id: "principal" });
+        const { salt, hash } = hashPassword(principalPassword);
+        acc.email = email;
+        acc.pwSalt = salt;
+        acc.pwHash = hash;
+        acc.status = "active";
+        acc.pendingEmail = null;
+        acc.emailVerifiedAt = null;
+        acc.mustChange = true;
+        acc.temp = false;
+        acc.failed = 0;
+        acc.lockedUntil = 0;
+        const resetAt = now();
+        for (const s of store.db.sessions) if (s.accountId === acc.id && !s.revokedAt) s.revokedAt = resetAt;
+        audit("principal_reset", { by: "bootstrap", target: acc.email, detail: "credentials reset from ASPIRE_RESET_PRINCIPAL (all sessions signed out)" });
+        store.save();
+        log(`ASPIRE_RESET_PRINCIPAL applied to ${acc.email} – sign in with the environment password, then remove the flag.`);
+      }
+    }
+
+    // First Principal: created once from the environment (one-time bootstrap).
+    // This bootstrap login is used to provision teacher accounts.
+    if (principalEmail && principalPassword) {
+      const email = normEmail(principalEmail);
+      const problem = passwordProblem(principalPassword, { email, name: "Principal" });
+      if (!emailOk(email)) log("ASPIRE_PRINCIPAL_EMAIL is not a valid email – no Principal account created.");
+      else if (problem) log(`ASPIRE_PRINCIPAL_PASSWORD does not meet the password policy (${problem}) – no Principal account created.`);
+      else if (!findAccount(email)) {
+        newAccount({ email, role: "principal", name: "School Principal", password: principalPassword, mustChange: true, id: "principal" });
+        audit("account_created", { by: "bootstrap", target: email, detail: "initial Principal (env bootstrap)" });
+        log(`Principal account created for ${email} – password change required at first sign-in.`);
+      }
     }
   }
+
+  // What index.js awaits before listening. The JSON store is ready synchronously,
+  // so local dev and tests keep the previous behaviour exactly.
+  const initialised = store.pendingLoad
+    ? store.ready().then(bootstrapInitialState)
+    : (bootstrapInitialState(), Promise.resolve());
+  initialised.catch(() => {});
 
   // ------------------------------------------------------------------- API
   // Retention sweep: runs once at boot and then hourly. It archives — never
@@ -1643,7 +1739,11 @@ export function createApp(opts = {}) {
     const p = url.pathname;
     const m = req.method;
 
-    if (p === "/api/health" && m === "GET") return send(res, 200, { ok: true, version: store.db.version, uptime: Math.round(process.uptime()) });
+    if (p === "/api/health" && m === "GET") {
+      // `mail` is a non-secret snapshot (masked user, no password) so a deployment
+      // can be checked from outside: problem:"" means mail is usable.
+      return send(res, 200, { ok: true, version: store.db.version, uptime: Math.round(process.uptime()), mail: mailer.status() });
+    }
 
     if (p === "/api/config" && m === "GET")
       return send(res, 200, { accessCodeRequired: Boolean(accessCode), demoReset: Boolean(allowReset) && process.env.NODE_ENV !== "production", passwordMin: PASSWORD_MIN, passwordPolicy: POLICY_TEXT, school: { ...D.SCHOOL, phone: schoolPhone } });
@@ -1976,16 +2076,16 @@ export function createApp(opts = {}) {
     if (m !== "GET") rateLimit(req, "write", 120);
     runEscalations(); // deterministic, time-based escalation (also runs on a timer)
 
-    // ---- Super Admin console: accounts, audit trail, school year.
+    // ---- Principal console: accounts, audit trail, school year.
     // Read/write here ONLY – this role can never edit live scores, dispatch or modes.
     if (p === "/api/admin/accounts" && m === "GET") {
-      need(user, "super_admin");
+      need(user, "principal");
       const t = now();
       return send(res, 200, { accounts: store.db.accounts.map((a) => publicAccount(a, t)) });
     }
 
     if (p === "/api/admin/accounts" && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const body = await readJson(req);
       const email = normEmail(body.email);
       if (!emailOk(email)) throw bad("Enter a valid email address.");
@@ -1999,7 +2099,7 @@ export function createApp(opts = {}) {
         org = clean(body.org, 20);
         if (!ACCOUNT_ORGS.has(org)) throw bad("Choose the organization this responder answers for: Barangay Sinalhan or CDRRMO.", "org_required");
       }
-      const name = clean(body.name, 80) || ({ responder: D.orgLabel(org), parent: "Parent / PTA Representative", super_admin: "Super Admin" }[role] || "");
+      const name = clean(body.name, 80) || ({ responder: D.orgLabel(org), parent: "Parent / PTA Representative", principal: "Principal" }[role] || "");
       if (!name) throw bad("Name is required.");
       let section = null;
       if (role === "parent") {
@@ -2047,7 +2147,7 @@ export function createApp(opts = {}) {
 
     let minvite = p.match(/^\/api\/admin\/accounts\/([\w-]+)\/invite\/(resend|revoke)$/);
     if (minvite && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const acc = accountById(minvite[1]);
       if (!acc) throw new HttpError(404, "not_found", "Account not found.");
       if (acc.status !== "invited") throw bad("Only an invited account has an invitation to manage.");
@@ -2065,12 +2165,12 @@ export function createApp(opts = {}) {
       return send(res, 200, { ok: true, account: publicAccount(acc), maskedEmail: sent.maskedEmail });
     }
 
-    // Edit an existing account. The Super Admin owns the email and display name;
+    // Edit an existing account. The Principal owns the email and display name;
     // a teacher's class fields use the same roster edit path as the Principal's
     // form, a Parent/PTA account moves section, and a responder gets its org.
     let medit = p.match(/^\/api\/admin\/accounts\/([\w-]+)$/);
     if (medit && m === "PUT") {
-      need(user, "super_admin");
+      need(user, "principal");
       const acc = accountById(medit[1]);
       if (!acc) throw new HttpError(404, "not_found", "Account not found.");
       if (acc.status === "purged") throw new HttpError(409, "purged", "This account was purged and can no longer be edited.");
@@ -2179,7 +2279,7 @@ export function createApp(opts = {}) {
 
     let mact = p.match(/^\/api\/admin\/accounts\/([\w-]+)\/(reset-password|deactivate|activate|unlock|archive|restore)$/);
     if (mact && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const acc = accountById(mact[1]);
       if (!acc) throw new HttpError(404, "not_found", "Account not found.");
       const action = mact[2];
@@ -2199,8 +2299,8 @@ export function createApp(opts = {}) {
       }
       if (action === "deactivate") {
         if (acc.id === user.id) throw bad("You cannot deactivate your own account.");
-        if (acc.role === "super_admin" && !store.db.accounts.some((a) => a.id !== acc.id && a.role === "super_admin" && a.status === "active"))
-          throw new HttpError(409, "last_admin", "At least one Super Admin account must stay active.");
+        if (acc.role === "principal" && !store.db.accounts.some((a) => a.id !== acc.id && a.role === "principal" && a.status === "active"))
+          throw new HttpError(409, "last_admin", "At least one Principal account must stay active.");
         acc.status = "inactive";
         const revoked = revokeSessions(acc.id);
         store.save();
@@ -2226,7 +2326,7 @@ export function createApp(opts = {}) {
         if (acc.teacherId) commit({ type: "roster_updated", id: acc.teacherId });
         return send(res, 200, { ok: true, account: publicAccount(acc) });
       }
-      // unlock – Super Admin can release a locked account early
+      // unlock – Principal can release a locked account early
       const wasLocked = acc.lockedUntil > t;
       acc.failed = 0; acc.lockedUntil = 0;
       store.save();
@@ -2238,7 +2338,7 @@ export function createApp(opts = {}) {
     // Read-only eligibility card. Every period here is a PLACEHOLDER set by the
     // school's data protection contact (see server/retention.js).
     if (p === "/api/admin/retention" && m === "GET") {
-      need(user, "super_admin");
+      need(user, "principal");
       const t = now();
       const archivedIncidents = store.db.incidents.filter((i) => i.archivedAt);
       const eligibleIncidents = archivedIncidents.filter((i) => !i.anonymizedAt && incidentExpired(i, t, retention.incidentDays));
@@ -2271,7 +2371,7 @@ export function createApp(opts = {}) {
     /** Replace a person's name with a role/organisation label (purge, timeline, headcounts). */
     const actorLabel = (role, org = null) => (role === "responder"
       ? (D.orgLabel(org) || "Responder")
-      : ({ teacher: "Teacher", principal: "Principal", super_admin: "Admin", parent: "Parent/PTA", system: "System" }[role] || "Unknown"));
+      : ({ teacher: "Teacher", principal: "Principal", parent: "Parent/PTA", system: "System" }[role] || "Unknown"));
 
     /** Anonymise a ticket: identifiers and free-text notes out, statistics kept. */
     function anonymizeIncident(inc) {
@@ -2297,7 +2397,7 @@ export function createApp(opts = {}) {
     }
 
     if (p === "/api/admin/incidents/purge" && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const body = await readJson(req);
       const reason = clean(body.reason, 200);
       if (!reason) throw bad("A reason is required.", "reason_required");
@@ -2335,7 +2435,7 @@ export function createApp(opts = {}) {
 
     let mpurge = p.match(/^\/api\/admin\/accounts\/([\w-]+)\/purge$/);
     if (mpurge && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const acc = accountById(mpurge[1]);
       if (!acc) throw new HttpError(404, "not_found", "Account not found.");
       const body = await readJson(req);
@@ -2346,7 +2446,7 @@ export function createApp(opts = {}) {
 
     // Data requests (restrict / erase) — reference and reason are mandatory.
     if (p === "/api/admin/data-requests" && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const body = await readJson(req);
       const type = clean(body.type, 20);
       if (type !== "restrict" && type !== "erase") throw bad("Type must be restrict or erase.", "type_required");
@@ -2386,7 +2486,7 @@ export function createApp(opts = {}) {
     }
 
     if (p === "/api/admin/audit" && m === "GET") {
-      need(user, "super_admin"); // read-only view of the audit log
+      need(user, "principal"); // read-only view of the audit log
       const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit")) || 200));
       const entries = store.db.audit.slice(-limit).reverse().map((e) => ({
         ...e,
@@ -2398,16 +2498,18 @@ export function createApp(opts = {}) {
     }
 
     if (p === "/api/admin/school-year" && m === "GET") {
-      need(user, "super_admin");
+      need(user, "principal");
       return send(res, 200, { ...store.db.schoolYear, accounts: store.db.accounts.length });
     }
 
     if (p === "/api/admin/school-year/start" && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const t = now();
       const issued = [];
       for (const acc of store.db.accounts) {
-        if (acc.role === "super_admin") continue; // admins are not rolled over
+        // The Principal running the rollover keeps their own session so they can
+        // hand out the new credentials; every other account is reset.
+        if (acc.id === account.id) continue;
         const pw = makeTempPassword(acc);
         const cred = hashPassword(pw);
         acc.pwSalt = cred.salt; acc.pwHash = cred.hash;
@@ -2419,20 +2521,20 @@ export function createApp(opts = {}) {
       store.save();
       audit("school_year_started", { by: user.email, detail: `new school year – ${issued.length} account(s) issued temporary credentials`, req });
       commit({ type: "school_year" });
-      // Temporary credentials are returned ONCE to the Super Admin for distribution and are never logged.
+      // Temporary credentials are returned ONCE to the Principal for distribution and are never logged.
       return send(res, 200, { year: store.db.schoolYear.count, startedAt: t, accounts: issued });
     }
 
-    // ---- Admin configuration (Super Admin only). The weights and thresholds exist
+    // ---- Admin configuration (Principal only). The weights and thresholds exist
     // ONLY behind this role guard; /api/config and /api/state never carry them.
     if (p === "/api/admin/config" && m === "GET") {
-      need(user, "super_admin");
+      need(user, "principal");
       const open = openRealTickets();
       return send(res, 200, { activeId: config.active().id, versions: config.list().slice().reverse(), openTickets: open });
     }
 
     if (p === "/api/admin/config" && m === "PUT") {
-      need(user, "super_admin");
+      need(user, "principal");
       const body = await readJson(req);
       requireReentry(account, body.password, req, "config_save");
       const open = openRealTickets();
@@ -2455,7 +2557,7 @@ export function createApp(opts = {}) {
 
     const mcfg = p.match(/^\/api\/admin\/config\/([\w-]+)\/restore$/);
     if (mcfg && m === "POST") {
-      need(user, "super_admin");
+      need(user, "principal");
       const body = await readJson(req);
       requireReentry(account, body.password, req, "config_restore");
       const source = config.list().find((v) => v.id === mcfg[1]);
@@ -2482,7 +2584,7 @@ export function createApp(opts = {}) {
     // archived, non-drill), drill records, and the system archive. Analytics are
     // aggregated server-side for the chosen period; no personal data is returned.
     if (p === "/api/records" && m === "GET") {
-      need(user, "principal", "super_admin");
+      need(user, "principal");
       const period = R.resolvePeriod({
         period: url.searchParams.get("period") || "sy",
         from: url.searchParams.get("from") || "",
@@ -2499,7 +2601,7 @@ export function createApp(opts = {}) {
         .map(recordEntry)
         .sort((a, b) => (b.archivedAt || 0) - (a.archivedAt || 0));
       const dm = store.db.modes.drill;
-      const accounts = user.role === "super_admin"
+      const accounts = false
         ? store.db.accounts
             .filter((a) => a.status === "archived" || a.status === "purged")
             .map((a) => publicAccount(a))
@@ -2579,7 +2681,7 @@ export function createApp(opts = {}) {
       if (entry) return "Teacher";
       const acc = accountById(id);
       if (!acc) return "Unknown";
-      return { teacher: "Teacher", principal: "Principal", super_admin: "Admin", responder: "Responder", parent: "Parent/PTA" }[acc.role] || "Unknown";
+      return { teacher: "Teacher", principal: "Principal", responder: "Responder", parent: "Parent/PTA" }[acc.role] || "Unknown";
     };
 
     /** Read-only archive row: the reporter is shown as a role label, never a name/id. */
@@ -2675,7 +2777,7 @@ export function createApp(opts = {}) {
     // their own reports, a Responder the records of every ticket they can work with,
     // every other role is refused.
     if (p === "/api/incidents/archive" && m === "GET") {
-      if (!['principal', 'super_admin', 'teacher', 'responder'].includes(user.role))
+      if (!["principal", "teacher", "responder"].includes(user.role))
         throw new HttpError(403, "forbidden", "Your role cannot read the archive.");
       const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 50));
       const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
@@ -2863,6 +2965,8 @@ export function createApp(opts = {}) {
       const email = normEmail(body.email);
       if (!email) throw bad("Email is required.", "email_required");
       if (!emailOk(email)) throw bad("Enter a valid email address.", "invalid_email");
+      if (requireTeacherGmail && !/@(?:gmail\.com|googlemail\.com)$/i.test(email))
+        throw bad("Teacher accounts must use a real Gmail address.", "gmail_required");
       if (store.db.accounts.some((a) => normEmail(a.email) === email || normEmail(a.pendingEmail) === email))
         throw new HttpError(409, "email_taken", "An account with that email already exists.");
       if (mailReady() && !mailIpAllowed(req)) throw new HttpError(429, "rate_limited", "Too many messages. Try again in a few minutes.");
@@ -3076,14 +3180,17 @@ export function createApp(opts = {}) {
   return {
     server,
     store,
+    // Resolves once the persisted state is loaded (Postgres) – index.js waits for
+    // this before listening so no request can read or overwrite a half-loaded DB.
+    ready: () => initialised,
     runEscalations,
     runArchiveSweep,
     retention,
     mailer,
-    close() {
+    async close() {
       if (tickTimer) clearInterval(tickTimer);
       if (archiveTimer) clearInterval(archiveTimer);
-      store.flush();
+      await store.flush();
       for (const c of sseClients) { try { c.res.end(); } catch { /* ignore */ } }
       sseClients.clear();
       return new Promise((r) => server.close(() => r()));
